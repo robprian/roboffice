@@ -1,0 +1,70 @@
+# RobOffice Office — runs the office and the brain together in one container.
+#
+# Paste this file into "Compose from URL" in Hostinger VPS Docker Manager.
+# Every value has a default, so it starts with the environment fields empty — but always change the two secrets.
+services:
+  deskrpg-office:
+    image: ${OFFICE_IMAGE:-ghcr.io/robprian/roboffice-office:latest}
+    container_name: deskrpg-office
+    restart: unless-stopped
+    environment:
+      # ── Secrets ───────────────────────────────────────────────────
+      # Defaults are deliberately empty. A default secret written in a public compose file is not a secret —
+      # if nobody changes it, anyone who read this file knows the value.
+      #
+      # JWT_SECRET: if empty, the container generates one on first start and stores it in the volume
+      # (src/lib/runtime-paths.js). Each deploy gets a different value, so leaving it empty is safer.
+      # Set it yourself only when several machines must share sessions.
+      JWT_SECRET: ${JWT_SECRET:-}
+      # Traefik exposes the dashboard at a public address. Without a password Hermes itself
+      # refuses the public bind (fail-closed) — set a value to open the dashboard.
+      HERMES_DASHBOARD_BASIC_AUTH_USERNAME: ${DASHBOARD_USER:-admin}
+      HERMES_DASHBOARD_BASIC_AUTH_PASSWORD: ${DASHBOARD_PASSWORD:-}
+
+      # ── Model provider (fill just one) ────────────────────────────
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+
+      # ── Optional ──────────────────────────────────────────────────
+      # Update Hermes and RobOffice to the latest on every container start. When off, the versions baked into the image are used.
+      DESKRPG_AUTO_UPDATE: ${DESKRPG_AUTO_UPDATE:-true}
+      HERMES_DASHBOARD: "true"
+      HERMES_DASHBOARD_HOST: 0.0.0.0
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+      REGISTRATION_DISABLED: ${REGISTRATION_DISABLED:-}
+      NEXT_PUBLIC_REGISTRATION_DISABLED: ${REGISTRATION_DISABLED:-}
+    volumes:
+      # The Hermes home (/opt/data) and the RobOffice runtime (/opt/data/deskrpg) live in one volume.
+      # Profiles, personas, kanban, sessions and uploads are all here, so this volume is the office.
+      - office-data:/opt/data
+    networks:
+      - default
+      - traefik-proxy
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=traefik-proxy
+      # The office — sockets ride the same origin.
+      - traefik.http.routers.deskrpg.rule=Host(`deskrpg.${TRAEFIK_HOST:-localhost}`)
+      - traefik.http.routers.deskrpg.entrypoints=https
+      - traefik.http.routers.deskrpg.tls.certresolver=letsencrypt
+      - traefik.http.routers.deskrpg.service=deskrpg
+      - traefik.http.services.deskrpg.loadbalancer.server.port=3000
+      - traefik.http.routers.deskrpg-socket.rule=Host(`deskrpg.${TRAEFIK_HOST:-localhost}`) && PathPrefix(`/socket.io`)
+      - traefik.http.routers.deskrpg-socket.entrypoints=https
+      - traefik.http.routers.deskrpg-socket.tls.certresolver=letsencrypt
+      - traefik.http.routers.deskrpg-socket.service=deskrpg-socket
+      - traefik.http.services.deskrpg-socket.loadbalancer.server.port=3001
+      # Hermes dashboard — a separate host. Hermes sets the password itself.
+      - traefik.http.routers.hermes-dashboard.rule=Host(`hermes.${TRAEFIK_HOST:-localhost}`)
+      - traefik.http.routers.hermes-dashboard.entrypoints=https
+      - traefik.http.routers.hermes-dashboard.tls.certresolver=letsencrypt
+      - traefik.http.routers.hermes-dashboard.service=hermes-dashboard
+      - traefik.http.services.hermes-dashboard.loadbalancer.server.port=9119
+
+volumes:
+  office-data:
+
+networks:
+  traefik-proxy:
+    external: true

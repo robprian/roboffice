@@ -1,0 +1,114 @@
+// src/lib/adapters/types.ts
+// NPC Adapter abstraction layer — all agent backends implement this interface.
+
+import type { ParsedApprovalEvent } from "@/lib/tool-approval-event";
+
+export interface AdapterExecuteOptions {
+  sessionKey: string;
+  prompt: string;
+  /**
+   * The caller owns the conversation (ConversationEngine): every turn carries its own
+   * transcript and nothing may be written to a persisted per-NPC session. Backends that
+   * have both a stateless and a persisted-session transport MUST pick the stateless one
+   * when this is true — including when `conversationHistory` is empty, which is the normal
+   * state of a poll call and of the first turn of a meeting.
+   * Absent/false means a 1:1 DM, which keeps its persisted session.
+   */
+  multiParty?: boolean;
+  /** Multi-party transcript owned by the caller (ConversationEngine). */
+  conversationHistory?: Array<{ role: string; content: string }>;
+  /**
+   * The system instruction carried on this turn. Built by `composeNpcInstructions()`
+   * assembling the layers. The backend MUST carry this in **the system slot, not a user
+   * message**.
+   * If there's no layer to carry, the caller doesn't pass this at all (never an empty
+   * string).
+   */
+  instructions?: string;
+  onDelta?: (chunk: string) => void;
+  onToolProgress?: (toolName: string, preview: string) => void;
+  /** Fires as soon as the backend assigns a run handle, for abort/steer. */
+  onRunStarted?: (runId: string) => void;
+  /** Hermes paused this run for a tool approval (dangerous command or untrusted MCP write tool). */
+  onApprovalRequest?: (event: ParsedApprovalEvent) => void;
+  attachments?: AdapterAttachment[];
+  model?: string;
+  locale?: string;
+  timeoutMs?: number;
+  userId?: string;
+  projectId?: string;
+}
+
+export interface AdapterAttachment {
+  type: "image" | "document" | "text";
+  mimeType: string;
+  fileName: string;
+  content: string;
+}
+
+export interface AdapterSessionInfo {
+  sessionRef: string;
+  displayId?: string;
+}
+
+export interface AdapterHealthResult {
+  status: "ok" | "error" | "not_installed";
+  message?: string;
+  version?: string;
+  model?: string;
+}
+
+export interface AdapterConfigField {
+  key: string;
+  label: string;
+  type: "text" | "select" | "toggle" | "number" | "textarea";
+  options?: Array<{ value: string; label: string }>;
+  default?: unknown;
+  hint?: string;
+  required?: boolean;
+}
+
+export interface AdapterConfigSchema {
+  fields: AdapterConfigField[];
+}
+
+export interface NpcAdapter {
+  readonly type: string;
+
+  execute(options: AdapterExecuteOptions): Promise<{
+    response: string;
+    session: AdapterSessionInfo;
+  }>;
+
+  abort?(sessionKey: string): Promise<void>;
+  steer?(text: string): Promise<void>;
+
+  getSessionSummary?(sessionKey: string): Promise<string>;
+  resetSession?(sessionKey: string): Promise<void>;
+
+  testConnection(config: Record<string, unknown>): Promise<AdapterHealthResult>;
+
+  getConfigSchema?(): AdapterConfigSchema;
+}
+
+export class AdapterRegistry {
+  private adapters = new Map<string, NpcAdapter>();
+
+  register(adapter: NpcAdapter): void {
+    this.adapters.set(adapter.type, adapter);
+  }
+
+  get(type: string): NpcAdapter {
+    const adapter = this.adapters.get(type);
+    if (!adapter) throw new Error(`Unknown adapter type: ${type}`);
+    return adapter;
+  }
+
+  has(type: string): boolean {
+    return this.adapters.has(type);
+  }
+
+  listInstalled(): string[] {
+    return [...this.adapters.keys()];
+  }
+}

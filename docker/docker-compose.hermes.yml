@@ -1,0 +1,123 @@
+# docker/docker-compose.hermes.yml — RobOffice + Hermes on your own computer (no VPS, no Traefik).
+# The VPS stack (root docker-compose.yml) opens no ports and requires HTTPS cookies; this one
+# publishes to 127.0.0.1 only and runs over plain HTTP.
+#
+#   printf 'HERMES_API_KEY=%s\n' "$(openssl rand -hex 32)" > .env.hermes
+#   echo 'OPENROUTER_API_KEY=...' >> .env.hermes   # or OPENAI_API_KEY / ANTHROPIC_API_KEY
+#   docker compose --env-file .env.hermes -f docker/docker-compose.hermes.yml up -d
+#
+# Office: http://localhost:3102. In RobOffice register the gateway as http://hermes:8642 with
+# HERMES_API_KEY as the token. Hermes dashboard (optional): set HERMES_DASHBOARD_PASSWORD,
+# then http://localhost:9119 (user admin).
+services:
+  deskrpg:
+    image: ${DESKRPG_IMAGE:-ghcr.io/robprian/roboffice:latest}
+    restart: unless-stopped
+    depends_on:
+      - hermes
+    ports:
+      - "127.0.0.1:3102:3000"
+      - "127.0.0.1:3103:3001"
+    environment:
+      DB_TYPE: sqlite
+      SQLITE_PATH: /app/data/deskrpg.db
+      # Inside the volume so a generated JWT_SECRET survives image updates.
+      DESKRPG_HOME: /app/data/home
+      JWT_SECRET: ${JWT_SECRET:-}
+      # Plain HTTP on localhost: a Secure cookie would be dropped and login would loop.
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      INTERNAL_HOSTNAME: 0.0.0.0
+    volumes:
+      - deskrpg-data:/app/data
+
+  # One-shot: the plugin commit this RobOffice image was released with, for hermes-plugins. A new
+  # commit (a new or rolled-back image) also restarts Hermes so it serves the reinstalled plugin.
+  plugin-pin:
+    image: ${DESKRPG_IMAGE:-ghcr.io/robprian/roboffice:latest}
+    restart: "no"
+    user: root
+    entrypoint: ["sh", "-c"]
+    command:
+      - sed -n 's/^export const PLUGIN_PIN = "\([0-9a-f]\{40\}\)";$$/\1/p' src/lib/hermes/setup/pin.ts > /pin/ref
+    volumes:
+      - plugin-pin:/pin
+
+  # Same key/UID as hermes: without API_SERVER_KEY the image writes a random key to the
+  # volume's .env, which then overrides HERMES_API_KEY (RobOffice gets 401).
+  # Disable, reinstall, enable: upstream does not replace an ENABLED plugin with Python deps
+  # without a terminal. A failed install or enable keeps (or puts back) the old commit.
+  hermes-plugins:
+    image: ${HERMES_IMAGE:-nousresearch/hermes-agent:latest}
+    restart: "no"
+    depends_on:
+      plugin-pin:
+        condition: service_completed_successfully
+    environment:
+      HERMES_UID: ${HERMES_UID:-10000}
+      HERMES_GID: ${HERMES_GID:-10000}
+      API_SERVER_KEY: ${HERMES_API_KEY:?set HERMES_API_KEY in your env file}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    volumes:
+      - hermes-data:/opt/data
+      - plugin-pin:/pin:ro
+    # Hermes reads provider keys from /opt/data/.env, not from the container environment
+    # (a key passed only as env leaves every profile on "Provider authentication failed"),
+    # and a new employee inherits the key from that file when it is hired.
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        touch /opt/data/.env
+        for v in OPENROUTER_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY; do
+          val=$$(printenv "$$v" || true)
+          [ -n "$$val" ] || continue
+          grep -v "^$$v=" /opt/data/.env > /tmp/env.next || true
+          printf '%s=%s\n' "$$v" "$$val" >> /tmp/env.next
+          cat /tmp/env.next > /opt/data/.env
+        done
+        u=https://github.com/dandacompany/deskrpg-hermes-plugin; d=/opt/data/plugins/deskrpg; p="hermes plugins"
+        pin=$$(cat /pin/ref 2>/dev/null || true); h=$$(git -c safe.directory='*' -C $$d rev-parse HEAD 2>/dev/null || true)
+        if [ -n "$$pin" ] && [ "$$h" != "$$pin" ]; then
+          $$p disable deskrpg || true
+          $$p install $$u --ref "$$pin" --force --no-enable || [ -d $$d ]
+        elif [ ! -d $$d ]; then $$p install $$u --no-enable; fi
+        $$p enable deskrpg || { [ -n "$$h" ] && $$p install $$u --ref "$$h" --force --no-deps && $$p enable deskrpg; }
+
+  # API server stays on the compose network (http://hermes:8642); only the dashboard is
+  # published, and only when a password is set.
+  hermes:
+    image: ${HERMES_IMAGE:-nousresearch/hermes-agent:latest}
+    restart: unless-stopped
+    command: ["gateway", "run"]
+    depends_on:
+      hermes-plugins:
+        condition: service_completed_successfully
+      plugin-pin:
+        condition: service_completed_successfully
+        restart: true
+    ports:
+      - "127.0.0.1:9119:9119"
+    environment:
+      HERMES_UID: ${HERMES_UID:-10000}
+      HERMES_GID: ${HERMES_GID:-10000}
+      API_SERVER_ENABLED: "true"
+      API_SERVER_HOST: 0.0.0.0
+      API_SERVER_PORT: "8642"
+      API_SERVER_KEY: ${HERMES_API_KEY:?set HERMES_API_KEY in your env file}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      HERMES_DASHBOARD: ${HERMES_DASHBOARD_PASSWORD:+true}
+      HERMES_DASHBOARD_BASIC_AUTH_USERNAME: ${HERMES_DASHBOARD_USER:-admin}
+      HERMES_DASHBOARD_BASIC_AUTH_PASSWORD: ${HERMES_DASHBOARD_PASSWORD:-}
+      HERMES_DASHBOARD_PUBLIC_URL: http://localhost:9119
+    volumes:
+      - hermes-data:/opt/data
+
+volumes:
+  deskrpg-data:
+  hermes-data:
+  plugin-pin:

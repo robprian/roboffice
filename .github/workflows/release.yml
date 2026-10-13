@@ -1,0 +1,240 @@
+name: Release
+
+# Pushing a date tag (YYYY.M.D) publishes npm → GHCR → GitHub Release in one go.
+# The only human steps are the version commit and `git push origin <tag>`.
+#
+# Required secrets:
+#   NPM_TOKEN            — npmjs granular token (publish, package deskrpg). Signed with --provenance.
+#   GHCR uses the repository GITHUB_TOKEN (packages: write).
+on:
+  push:
+    tags: ["20[0-9][0-9].[0-9]*.[0-9]*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/robprian/roboffice
+
+jobs:
+  # If the tag and package.json differ, publish nothing.
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: 공개 트리 메타 파일 검사
+        run: bash scripts/check-public-tree.sh
+      - id: ver
+        run: |
+          # A date tag must point at a commit already on master.
+          git fetch --no-tags origin master
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/master; then
+            echo "태그 커밋은 origin/master 에 포함되어야 합니다." >&2
+            exit 1
+          fi
+          TAG="${GITHUB_REF_NAME}"
+          PKG="$(node -p "require('./package.json').version")"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "태그($TAG)와 package.json($PKG)이 다릅니다. 버전 커밋을 먼저 미세요." >&2
+            exit 1
+          fi
+          for f in README.md README.ko.md; do
+            grep -q "$PKG" "$f" || { echo "$f 에 $PKG 가 없습니다." >&2; exit 1; }
+          done
+          echo "version=$PKG" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # Recheck the same format gate as CI before publishing publicly.
+      - name: 포매팅 검사
+        run: npm run format:check
+      - run: npm run test
+      - run: npm run typecheck
+      - run: npm run lint
+      # Verify the tarball before publishing Docker platform images.
+      - name: Smoke npm tarball before publishing
+        run: |
+          smoke_dir="$(mktemp -d)"
+          npm pack --pack-destination "$smoke_dir" >/dev/null
+          tarball="$smoke_dir/deskrpg-$(node -p "require('./package.json').version").tgz"
+          test -f "$tarball"
+          python3 scripts/check-npm-tarball.py "$tarball"
+          bash scripts/smoke-npm-install.sh "$tarball"
+
+  npm:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      contents: read
+      id-token: write # npm --provenance (Sigstore OIDC)
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      # Inspect and run the exact tarball handed to npm publish.
+      - name: Publish deskrpg@${{ needs.verify.outputs.version }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          V="${{ needs.verify.outputs.version }}"
+          if npm view "deskrpg@$V" version >/dev/null 2>&1; then
+            echo "deskrpg@$V 는 이미 발행돼 있어 건너뜁니다."
+          else
+            pack_dir="$(mktemp -d)"
+            npm pack --pack-destination "$pack_dir" >/dev/null
+            tarball="$pack_dir/deskrpg-$V.tgz"
+            test -f "$tarball"
+            python3 scripts/check-npm-tarball.py "$tarball"
+            bash scripts/smoke-npm-install.sh "$tarball"
+            npm publish "$tarball" --provenance --access public
+          fi
+      - name: Wait for registry propagation
+        run: |
+          V="${{ needs.verify.outputs.version }}"
+          # The registry usually needs 5-7 minutes for the large runtime assets, but
+          # 2026.929.1 took about 26. Poll for up to 45 minutes, backing off from 5s to 30s.
+          deadline=$((SECONDS + 45 * 60))
+          delay=5
+          i=0
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            i=$((i + 1))
+            npm view "deskrpg@$V" version >/dev/null 2>&1 && { echo "propagated after attempt $i (${SECONDS}s)"; exit 0; }
+            sleep "$delay"
+            delay=$((delay < 30 ? delay + 5 : 30))
+          done
+          echo "::error::deskrpg@$V did not appear on the registry within 45 minutes. The publish may still have succeeded."
+          echo "Once 'npm view deskrpg@$V version' prints the version, rerun the failed jobs:" >&2
+          echo "  gh run rerun ${{ github.run_id }} --failed" >&2
+          echo "The rerun skips the publish step because the version already exists." >&2
+          exit 1
+      # Tests from the source tree missed problems with the npm global install location (node_modules).
+      - name: Smoke registry-installed npm CLI
+        env:
+          V: ${{ needs.verify.outputs.version }}
+        run: bash scripts/smoke-npm-install.sh "deskrpg@$V"
+
+  docker-platform:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Each native runner builds one platform only. No QEMU cross builds.
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          tags: ${{ env.IMAGE }}:${{ needs.verify.outputs.version }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,scope=${{ matrix.arch }},mode=max
+
+  docker-manifest:
+    # If the npm install smoke test fails, do not publish :latest.
+    needs: [verify, npm, docker-platform]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Join native platform images
+        env:
+          V: ${{ needs.verify.outputs.version }}
+        run: |
+          docker buildx imagetools create \
+            -t "$IMAGE:$V" -t "$IMAGE:latest" \
+            "$IMAGE:$V-amd64" "$IMAGE:$V-arm64"
+      - name: Verify both platforms
+        env:
+          V: ${{ needs.verify.outputs.version }}
+        run: |
+          docker buildx imagetools inspect "$IMAGE:$V" > /tmp/deskrpg-platforms
+          grep -Eq 'Platform:[[:space:]]+linux/amd64' /tmp/deskrpg-platforms
+          grep -Eq 'Platform:[[:space:]]+linux/arm64' /tmp/deskrpg-platforms
+      - name: Verify public anonymous pull
+        env:
+          V: ${{ needs.verify.outputs.version }}
+        run: |
+          docker logout ghcr.io
+          docker buildx imagetools inspect "$IMAGE:$V" > /dev/null
+
+  github-release:
+    needs: [verify, npm, docker-manifest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Release notes
+        env:
+          V: ${{ needs.verify.outputs.version }}
+        run: |
+          PREV="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
+          {
+            echo "## RobOffice $V"
+            echo
+            echo "### Changes"
+            if [ -n "$PREV" ]; then git log --no-merges --pretty='- %s' "$PREV..${GITHUB_REF_NAME}"; else git log --no-merges --pretty='- %s' -n 30; fi
+            echo
+            echo "### Install"
+            echo '```'
+            echo "npm install -g deskrpg@$V"
+            echo "docker pull ghcr.io/robprian/roboffice:$V   # linux/amd64 + linux/arm64"
+            echo '```'
+            echo
+            echo "- npm: https://www.npmjs.com/package/deskrpg/v/$V (provenance signed)"
+            echo "- GHCR: https://github.com/robprian/roboffice/pkgs/container/deskrpg"
+          } > /tmp/notes.md
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ needs.verify.outputs.version }}
+        run: gh release create "$V" --title "RobOffice $V" --notes-file /tmp/notes.md --verify-tag

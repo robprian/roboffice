@@ -1,0 +1,685 @@
+import { describe, test } from "node:test";
+import assert from "node:assert/strict";
+import { HermesClient, HermesError } from "./hermes-client";
+
+function sseResponse(frames: string[]): Response {
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const enc = new TextEncoder();
+      for (const f of frames) controller.enqueue(enc.encode(f));
+      controller.close();
+    },
+  });
+  return new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+}
+
+describe("HermesClient.url", () => {
+  test("prefixes named profiles", () => {
+    const c = new HermesClient({ baseUrl: "http://gw:8642", profileName: "sophie", token: "t" });
+    assert.equal(c.url("/v1/runs"), "http://gw:8642/p/sophie/v1/runs");
+  });
+
+  test("omits the prefix for the default profile", () => {
+    const c = new HermesClient({ baseUrl: "http://gw:8642", profileName: null, token: "t" });
+    assert.equal(c.url("/v1/runs"), "http://gw:8642/v1/runs");
+  });
+
+  test("strips a trailing slash from baseUrl", () => {
+    const c = new HermesClient({ baseUrl: "http://gw:8642/", profileName: "danvi", token: "t" });
+    assert.equal(c.url("/health"), "http://gw:8642/p/danvi/health");
+  });
+});
+
+describe("HermesClient auth and errors", () => {
+  test("sends the profile token as a bearer header", async () => {
+    let seen: Headers | undefined;
+    const fetchImpl = async (_u: string | URL | Request, init?: RequestInit) => {
+      seen = new Headers(init?.headers);
+      return new Response(JSON.stringify({ features: {}, endpoints: {} }), { status: 200 });
+    };
+    const c = new HermesClient({
+      baseUrl: "http://gw:8642",
+      profileName: "sophie",
+      token: "secret-key",
+      fetchImpl: fetchImpl as typeof fetch,
+    });
+    await c.getCapabilities();
+    assert.equal(seen?.get("Authorization"), "Bearer secret-key");
+  });
+
+  test("maps 401 to unauthorized", async () => {
+    const fetchImpl = async () =>
+      new Response(JSON.stringify({ error: { message: "bad key" } }), { status: 401 });
+    const c = new HermesClient({
+      baseUrl: "http://gw:8642",
+      profileName: "sophie",
+      token: "t",
+      fetchImpl: fetchImpl as typeof fetch,
+    });
+    await assert.rejects(
+      () => c.getCapabilities(),
+      (err: HermesError) => {
+        assert.equal(err.code, "unauthorized");
+        assert.equal(err.status, 401);
+        return true;
+      },
+    );
+  });
+
+  test("maps 404 to unknown_profile", async () => {
+    const fetchImpl = async () =>
+      new Response(JSON.stringify({ error: "Unknown or unconfigured profile" }), { status: 404 });
+    const c = new HermesClient({
+      baseUrl: "http://gw:8642",
+      profileName: "ghost",
+      token: "t",
+      fetchImpl: fetchImpl as typeof fetch,
+    });
+    await assert.rejects(
+      () => c.getCapabilities(),
+      (err: HermesError) => {
+        assert.equal(err.code, "unknown_profile");
+        return true;
+      },
+    );
+  });
+
+  test("maps a network throw to unreachable", async () => {
+    const fetchImpl = async () => {
+      throw new Error("ECONNREFUSED");
+    };
+    const c = new HermesClient({
+      baseUrl: "http://gw:8642",
+      profileName: null,
+      token: "t",
+      fetchImpl: fetchImpl as typeof fetch,
+    });
+    await assert.rejects(
+      () => c.getCapabilities(),
+      (err: HermesError) => {
+        assert.equal(err.code, "unreachable");
+        return true;
+      },
+    );
+  });
+});
+
+describe("HermesClient.streamSessionChat", () => {
+  test("accumulates deltas and returns the final text with run_id", async () => {
+    const fetchImpl = async () =>
+      sseResponse([
+        'event: run.started\ndata: {"run_id":"run-1","seq":1}\n\n',
+        'event: assistant.delta\ndata: {"delta":"안녕","run_id":"run-1","seq":2}\n\n',
+        'event: assistant.delta\ndata: {"delta":"하세요","run_id":"run-1","seq":3}\n\n',
+        'event: assistant.completed\ndata: {"content":"안녕하세요","session_id":"sess-9","run_id":"run-1","seq":4}\n\n',
+        'event: run.completed\ndata: {"run_id":"run-1","seq":5}\n\n',
+      ]);
+    const c = new HermesClient({
+      baseUrl: "http://gw:8642",
+      profileName: "sophie",
+      token: "t",
+      fetchImpl: fetchImpl as typeof fetch,
+    });
+
+    const names: string[] = [];
+    const result = await c.streamSessionChat({
+      sessionId: "sess-9",
+      message: "안녕",
+      onEvent: (e) => names.push(e.event),
+    });
+
+    assert.equal(result.text, "안녕하세요");
+    assert.equal(result.runId, "run-1");
+    assert.equal(result.sessionId, "sess-9");
+    assert.deepEqual(names, [
+      "run.started",
+      "assistant.delta",
+      "assistant.delta",
+      "assistant.completed",
+      "run.completed",
+    ]);
+  });
+
+  test("prefers assistant.completed content over accumulated deltas", async () => {
+    const fetchImpl = async () =>
+      sseResponse([
+        'event: assistant.delta\ndata: {"delta":"부분"}\n\n',
+        'event: assistant.completed\ndata: {"content":"완성본"}\n\n',
+        "event: done\ndata: {}\n\n",
+      ]);
+    const c = new HermesClient({
+      baseUrl: "http://gw:8642",
+      profileName: null,
+      token: "t",
+      fetchImpl: fetchImpl as typeof fetch,
+    });
+    const result = await c.streamSessionChat({ sessionId: "s", message: "m", onEvent: () => {} });
+    assert.equal(result.text, "완성본");
+  });
+
+  test("returns accumulated deltas when the stream ends without a completed event", async () => {
+    const fetchImpl = async () =>
+      sseResponse([
+        'event: assistant.delta\ndata: {"delta":"끊긴 "}\n\n',
+        'event: assistant.delta\ndata: {"delta":"응답"}\n\n',
+      ]);
+    const c = new HermesClient({
+      baseUrl: "http://gw:8642",
+      profileName: null,
+      token: "t",
+      fetchImpl: fetchImpl as typeof fetch,
+    });
+    const result = await c.streamSessionChat({ sessionId: "s", message: "m", onEvent: () => {} });
+    assert.equal(result.text, "끊긴 응답");
+  });
+
+  test("rejects on run.failed", async () => {
+    const fetchImpl = async () =>
+      sseResponse(['event: run.failed\ndata: {"message":"provider exploded"}\n\n']);
+    const c = new HermesClient({
+      baseUrl: "http://gw:8642",
+      profileName: null,
+      token: "t",
+      fetchImpl: fetchImpl as typeof fetch,
+    });
+    await assert.rejects(
+      () => c.streamSessionChat({ sessionId: "s", message: "m", onEvent: () => {} }),
+      (err: unknown) => {
+        assert.match((err as Error).message, /provider exploded/);
+        assert.equal((err as { code?: string }).code, "run_failed");
+        return true;
+      },
+    );
+  });
+
+  test("a run.failed without a message carries the failed turn's text instead", async () => {
+    // Measured on Hermes 0.21.2 (1:1 chat stream, expired provider sign-in): the reason arrives
+    // as an unfinished assistant.completed, and run.failed itself has no message field.
+    const failedTurn = JSON.stringify({
+      completed: false,
+      partial: false,
+      interrupted: false,
+      content:
+        "ChatGPT or Codex Subscription rejected your sign-in, so the model can't be reached. " +
+        "Sign in again: `hermes -p sophie auth add openai-codex --type oauth`.\n\n" +
+        "Provider said: HTTP 401: Incorrect API key provided: sk-test*****.",
+    });
+    const fetchImpl = async () =>
+      sseResponse([
+        `event: assistant.completed\ndata: ${failedTurn}\n\n`,
+        'event: run.failed\ndata: {"completed":false,"messages":[]}\n\n',
+      ]);
+    const c = new HermesClient({
+      baseUrl: "http://gw:8642",
+      profileName: null,
+      token: "t",
+      fetchImpl: fetchImpl as typeof fetch,
+    });
+    await assert.rejects(
+      () => c.streamSessionChat({ sessionId: "s", message: "m", onEvent: () => {} }),
+      (err: unknown) => {
+        assert.equal((err as { code?: string }).code, "run_failed");
+        assert.match((err as Error).message, /rejected your sign-in/);
+        return true;
+      },
+    );
+  });
+
+  test("sends the long-term memory scope header when a session key is given", async () => {
+    let seen: Headers | undefined;
+    const fetchImpl = async (_u: string | URL | Request, init?: RequestInit) => {
+      seen = new Headers(init?.headers);
+      return sseResponse(["event: done\ndata: {}\n\n"]);
+    };
+    const c = new HermesClient({
+      baseUrl: "http://gw:8642",
+      profileName: "sophie",
+      token: "t",
+      fetchImpl: fetchImpl as typeof fetch,
+    });
+    await c.streamSessionChat({
+      sessionId: "s",
+      message: "m",
+      sessionKey: "npc-42",
+      onEvent: () => {},
+    });
+    assert.equal(seen?.get("X-Hermes-Session-Key"), "npc-42");
+  });
+
+  test(
+    "stops reading the outer loop once a terminal event arrives (does not hang on a held-open connection)",
+    { timeout: 5000 },
+    async () => {
+      // A real Hermes server can keep the HTTP connection open past a terminal
+      // event (run.completed/done/etc). Simulate that: one chunk carries a
+      // non-terminal event followed by the terminal event, and the underlying
+      // stream is never closed and never enqueues anything further. If
+      // HermesClient's outer `reader.read()` loop is still running after the
+      // terminal event (i.e. only the inner `for...of` was broken), it would
+      // call read() again here and hang forever, since nothing more ever
+      // arrives and the stream never completes.
+      const enc = new TextEncoder();
+      let controllerRef: ReadableStreamDefaultController<Uint8Array> | undefined;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controllerRef = controller;
+          controller.enqueue(
+            enc.encode(
+              'event: assistant.delta\ndata: {"delta":"부분"}\n\n' +
+                'event: run.completed\ndata: {"run_id":"run-1"}\n\n',
+            ),
+          );
+          // Deliberately never closed — mimics a server holding the connection open.
+        },
+      });
+      const realReader = stream.getReader();
+      let readCallCount = 0;
+      let cancelled = false;
+      const wrappedReader = {
+        read: () => {
+          readCallCount += 1;
+          return realReader.read();
+        },
+        cancel: (reason?: unknown) => {
+          cancelled = true;
+          return realReader.cancel(reason);
+        },
+      };
+      const response = new Response(new ReadableStream(), {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+      Object.defineProperty(response, "body", { value: { getReader: () => wrappedReader } });
+      const fetchImpl = async () => response;
+
+      const c = new HermesClient({
+        baseUrl: "http://gw:8642",
+        profileName: null,
+        token: "t",
+        fetchImpl: fetchImpl as typeof fetch,
+      });
+      const names: string[] = [];
+      const result = await c.streamSessionChat({
+        sessionId: "s",
+        message: "m",
+        onEvent: (e) => names.push(e.event),
+      });
+
+      assert.equal(result.runId, "run-1");
+      assert.deepEqual(names, ["assistant.delta", "run.completed"]);
+      assert.equal(
+        readCallCount,
+        1,
+        "the outer read loop must not call read() again after the terminal event",
+      );
+      assert.equal(cancelled, true, "the stream reader must be cancelled after the terminal event");
+      void controllerRef;
+    },
+  );
+});
+
+describe("HermesClient.startRun", () => {
+  test("posts input plus conversation history and returns run_id", async () => {
+    let body: Record<string, unknown> = {};
+    let calledUrl = "";
+    const fetchImpl = async (u: string | URL | Request, init?: RequestInit) => {
+      calledUrl = String(u);
+      body = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify({ run_id: "run-7" }), { status: 202 });
+    };
+    const c = new HermesClient({
+      baseUrl: "http://gw:8642",
+      profileName: "danvi",
+      token: "t",
+      fetchImpl: fetchImpl as typeof fetch,
+    });
+
+    const result = await c.startRun({
+      input: "의견 주세요",
+      conversationHistory: [{ role: "user", content: "주제: 배포" }],
+    });
+
+    assert.equal(result.runId, "run-7");
+    assert.equal(calledUrl, "http://gw:8642/p/danvi/v1/runs");
+    assert.equal(body.input, "의견 주세요");
+    assert.deepEqual(body.conversation_history, [{ role: "user", content: "주제: 배포" }]);
+  });
+});
+
+describe("HermesClient.stopRun / steerRun", () => {
+  test("stopRun posts to the run stop endpoint", async () => {
+    let calledUrl = "";
+    const fetchImpl = async (u: string | URL | Request) => {
+      calledUrl = String(u);
+      return new Response("{}", { status: 200 });
+    };
+    const c = new HermesClient({
+      baseUrl: "http://gw:8642",
+      profileName: "sophie",
+      token: "t",
+      fetchImpl: fetchImpl as typeof fetch,
+    });
+    await c.stopRun("run-3");
+    assert.equal(calledUrl, "http://gw:8642/p/sophie/v1/runs/run-3/stop");
+  });
+
+  test("steerRun sends the guidance text", async () => {
+    let body: Record<string, unknown> = {};
+    const fetchImpl = async (_u: string | URL | Request, init?: RequestInit) => {
+      body = JSON.parse(String(init?.body));
+      return new Response("{}", { status: 200 });
+    };
+    const c = new HermesClient({
+      baseUrl: "http://gw:8642",
+      profileName: "sophie",
+      token: "t",
+      fetchImpl: fetchImpl as typeof fetch,
+    });
+    await c.steerRun("run-3", "짧게 답하세요");
+    assert.equal(body.text, "짧게 답하세요");
+  });
+});
+
+describe("HermesClient.createSession", () => {
+  function clientReturning(payload: unknown) {
+    return new HermesClient({
+      baseUrl: "http://gw:8642",
+      profileName: "danvi",
+      token: "t",
+      fetchImpl: (async () =>
+        new Response(JSON.stringify(payload), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })) as unknown as typeof fetch,
+    });
+  }
+
+  test("reads the id out of the nested session object", async () => {
+    // The measured v0.20.2 response shape. Failing to read this killed 1:1 chat entirely —
+    // the screen showed only "AI 게이트웨이 오류" and the cause was left only in the server log.
+    const c = clientReturning({
+      object: "hermes.session",
+      session: { id: "api_1787291339_b79d5388", source: "api_server", message_count: 0 },
+    });
+    assert.deepEqual(await c.createSession("t"), { sessionId: "api_1787291339_b79d5388" });
+  });
+
+  test("still accepts the flat shapes", async () => {
+    assert.deepEqual(await clientReturning({ session_id: "s1" }).createSession("t"), {
+      sessionId: "s1",
+    });
+    assert.deepEqual(await clientReturning({ id: "s2" }).createSession("t"), { sessionId: "s2" });
+  });
+
+  test("throws when no shape carries an id", async () => {
+    await assert.rejects(
+      () => clientReturning({ object: "hermes.session", session: {} }).createSession("t"),
+      (err: unknown) => err instanceof HermesError && err.code === "http_error",
+    );
+  });
+});
+
+describe("HermesClient.createSession — title conflict", () => {
+  test("when the title is already in use, continues that session", async () => {
+    // Hermes enforces title uniqueness. Our title is the NPC×user context key, so
+    // a conflict means "that conversation already exists" — it should be reused, not treated as a failure.
+    const calls: string[] = [];
+    const c = new HermesClient({
+      baseUrl: "http://gw:8642",
+      profileName: "danvi",
+      token: "t",
+      fetchImpl: (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        calls.push(`${init?.method ?? "GET"} ${url}`);
+        if (init?.method === "POST") {
+          return new Response(
+            JSON.stringify({
+              error: { code: "invalid_title", message: "Title already in use by session api_old" },
+            }),
+            { status: 400 },
+          );
+        }
+        return new Response(
+          JSON.stringify({ object: "list", data: [{ id: "api_old", title: "npc-1:user-1" }] }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }) as unknown as typeof fetch,
+    });
+    assert.deepEqual(await c.createSession("npc-1:user-1"), { sessionId: "api_old" });
+    assert.equal(calls.length, 2, "POST 로 만들어 보고, 충돌하면 GET 으로 찾는다");
+  });
+
+  test("on a conflict where the title isn't in the list, throws the original error", async () => {
+    const c = new HermesClient({
+      baseUrl: "http://gw:8642",
+      profileName: "danvi",
+      token: "t",
+      fetchImpl: (async (_i: RequestInfo | URL, init?: RequestInit) =>
+        init?.method === "POST"
+          ? new Response(JSON.stringify({ error: { code: "invalid_title" } }), { status: 400 })
+          : new Response(JSON.stringify({ object: "list", data: [] }), {
+              status: 200,
+            })) as unknown as typeof fetch,
+    });
+    await assert.rejects(
+      () => c.createSession("없는제목"),
+      (e: unknown) => e instanceof HermesError,
+    );
+  });
+});
+
+// Measured regression — a verbatim copy of the SSE from one meeting poll (Hermes v0.20.2).
+// The NPC clearly answered "SPEAK: …" but we received an empty string and tallied everyone as PASS.
+describe("HermesClient.streamRunEvents — /v1/runs dialect", () => {
+  test("forwards each delta before the upstream run completes", { timeout: 2000 }, async () => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({
+      start(c) {
+        controller = c;
+      },
+    });
+    const client = new HermesClient({
+      baseUrl: "http://gw:8642",
+      profileName: "noah",
+      token: "test",
+      fetchImpl: (async () => new Response(body)) as typeof fetch,
+    });
+    const seen: string[] = [];
+    let firstDelta!: () => void;
+    const first = new Promise<void>((resolve) => {
+      firstDelta = resolve;
+    });
+    let settled = false;
+    const result = client
+      .streamRunEvents("run_1", (event) => {
+        if (event.event === "message.delta") {
+          seen.push(String(event.data.delta));
+          firstDelta();
+        }
+      })
+      .then((value) => {
+        settled = true;
+        return value;
+      });
+    const enqueue = (event: object) =>
+      controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`));
+    enqueue({ event: "message.delta", delta: "첫 부분" });
+    await first;
+    assert.deepEqual(seen, ["첫 부분"]);
+    assert.equal(settled, false, "the first callback must not wait for completion");
+    enqueue({ event: "message.delta", delta: " 다음 부분" });
+    enqueue({ event: "run.completed" });
+    assert.equal((await result).text, "첫 부분 다음 부분");
+    assert.deepEqual(seen, ["첫 부분", " 다음 부분"]);
+  });
+
+  test("accumulates message.delta — if the meeting poll response is an empty string, everyone becomes PASS", async () => {
+    const frames = [
+      'data: {"event": "message.delta", "run_id": "run_1", "delta": "SPE"}\n\n',
+      'data: {"event": "message.delta", "run_id": "run_1", "delta": "AK: "}\n\n',
+      'data: {"event": "message.delta", "run_id": "run_1", "delta": "김치찌개"}\n\n',
+      'data: {"event": "reasoning.available", "run_id": "run_1"}\n\n',
+      'data: {"event": "run.completed", "run_id": "run_1"}\n\n',
+    ];
+    const client = new HermesClient({
+      baseUrl: "http://gw:8642",
+      profileName: "danvi",
+      token: "t",
+      fetchImpl: (async () =>
+        new Response(
+          new ReadableStream({
+            start(c) {
+              for (const f of frames) c.enqueue(new TextEncoder().encode(f));
+              c.close();
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "text/event-stream" } },
+        )) as unknown as typeof fetch,
+    });
+
+    const { text } = await client.streamRunEvents("run_1", () => {});
+    assert.equal(text, "SPEAK: 김치찌개");
+  });
+});
+
+describe("streamRunEvents — the output of run.completed is the final answer", () => {
+  function clientOf(frames: string[]) {
+    return new HermesClient({
+      baseUrl: "http://gw:8642",
+      profileName: "oliver",
+      token: "t",
+      fetchImpl: (async () =>
+        new Response(
+          new ReadableStream({
+            start(c) {
+              for (const f of frames) c.enqueue(new TextEncoder().encode(f));
+              c.close();
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "text/event-stream" } },
+        )) as unknown as typeof fetch,
+    });
+  }
+  const frame = (event: object) => `data: ${JSON.stringify(event)}\n\n`;
+
+  test("even if the deltas contain two generations, the body is the single output of run.completed", async () => {
+    // Measured on staging: the same paragraph, worded differently, was attached twice in a meeting speech bubble.
+    // /v1/runs doesn't emit message.completed and puts the final answer in run.completed's output (final_response).
+    // Deltas aren't rolled back, so when a model call is retried, text from the earlier attempt piles up too.
+    const { text } = await clientOf([
+      frame({ event: "message.delta", run_id: "r", delta: "Today I'll review… then suggest." }),
+      frame({
+        event: "message.delta",
+        run_id: "r",
+        delta: " Today I'll review… before recommending.",
+      }),
+      frame({
+        event: "run.completed",
+        run_id: "r",
+        output: "Today I'll review… before recommending.",
+      }),
+    ]).streamRunEvents("r", () => {});
+    assert.equal(text, "Today I'll review… before recommending.");
+  });
+
+  test("uses the accumulated deltas when output is empty or missing", async () => {
+    for (const completed of [{ output: "" }, {}]) {
+      const { text } = await clientOf([
+        frame({ event: "message.delta", run_id: "r", delta: "SPEAK: 안녕" }),
+        frame({ event: "run.completed", run_id: "r", ...completed }),
+      ]).streamRunEvents("r", () => {});
+      assert.equal(text, "SPEAK: 안녕");
+    }
+  });
+});
+
+describe("drain — a stream whose cancel never finishes after the terminal event", () => {
+  /**
+   * Measured (v0.20.2): the meeting path /v1/runs/<id>/events keeps the connection open even after sending
+   * run.completed. Awaiting reader.cancel() in that state neither resolves nor rejects and
+   * hangs forever. Meetings gather poll responses with Promise.allSettled, so if one participant gets stuck
+   * there the whole meeting stalls without producing even the first turn — and it actually was stuck that way.
+   *
+   * Builds a body whose cancel() never settles to pin that situation.
+   */
+  function neverCancellingSse(frames: string[]): Response {
+    const enc = new TextEncoder();
+    let i = 0;
+    const body = {
+      getReader() {
+        return {
+          read: async () =>
+            i < frames.length
+              ? { done: false, value: enc.encode(frames[i++]) }
+              : { done: true, value: undefined },
+          // Never settles — awaiting it hangs right there.
+          cancel: () => new Promise<void>(() => {}),
+        };
+      },
+    };
+    return { ok: true, status: 200, body } as unknown as Response;
+  }
+
+  test("returns the accumulated text without waiting for cancel", async () => {
+    const client = new HermesClient({
+      baseUrl: "http://gw:8642",
+      profileName: "danvi",
+      token: "t",
+      fetchImpl: (async () =>
+        neverCancellingSse([
+          'data: {"event":"message.delta","delta":"사"}\n\n',
+          'data: {"event":"message.delta","delta":"과"}\n\n',
+          'data: {"event":"run.completed","output":"사과"}\n\n',
+        ])) as unknown as typeof fetch,
+    });
+
+    const result = await Promise.race([
+      client.streamRunEvents("run_1", () => {}),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("drain 이 취소를 기다리다 멈췄습니다")), 3000),
+      ),
+    ]);
+
+    assert.equal(result.text, "사과");
+  });
+});
+
+describe("streamRunEvents — a failed run keeps its reason", () => {
+  test("run.failed on /v1/runs carries the reason in `error`, not `message`", async () => {
+    // Hermes 0.21.2 api_server_runs: a non-retryable client error (401/400) ends the run with
+    // `_finish("failed", error=<redacted provider text>)`. Shape of the provider text measured on
+    // staging with an expired openai-codex sign-in; the key is masked.
+    const failed = JSON.stringify({
+      event: "run.failed",
+      run_id: "run_1",
+      completed: false,
+      partial: false,
+      interrupted: false,
+      error:
+        "Error code: 401 - {'error': {'message': 'Incorrect API key provided: sk-test*****.'}}",
+    });
+    const client = new HermesClient({
+      baseUrl: "http://gw:8642",
+      profileName: "sophie",
+      token: "t",
+      fetchImpl: (async () =>
+        new Response(
+          new ReadableStream({
+            start(c) {
+              c.enqueue(new TextEncoder().encode(`data: ${failed}\n\n`));
+              c.close();
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "text/event-stream" } },
+        )) as unknown as typeof fetch,
+    });
+    await assert.rejects(
+      () => client.streamRunEvents("run_1", () => {}),
+      (err: unknown) => {
+        assert.equal((err as { code?: string }).code, "run_failed");
+        assert.match((err as Error).message, /Incorrect API key/);
+        return true;
+      },
+    );
+  });
+});

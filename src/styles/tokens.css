@@ -1,0 +1,37 @@
+/*
+ * RobOffice UI tokens — partially aligned to the Dante Labs brand v2 (Dante's decision, 2026-09-20).
+ *
+ * Text, status, shadow and radius use the brand tokens as is. **The product's only own color is office green**
+ * and it alone is the exception — a product identity continuing the warm green tone of the 3D office, so it keeps being used for buttons and selection markers.
+ * The brand rules (khaki for surfaces only, accents in blue on light surfaces) apply to marketing material, and the product screen's
+ * exceptions are written down in docs/standards.md.
+ */
+:root {
+  color-scheme: light;
+  --color-primary: #365e4b;
+  --color-primary-light: #426c54;
+  --color-primary-hover: #294a3a;
+  --color-primary-muted: #e6eee2;
+  --color-npc: #93632e;
+  --color-npc-dark: #704619;
+  --color-danger: #a63d33; /* brand danger */
+  --color-danger-hover: #8b3029;
+  --color-danger-bg: #f6e3de;
+  --color-info: #245c9e; /* brand blue-strong */
+  --color-success: #327649;
+  --color-meeting: #735b8f;
+  --text: #09223f; /* brand navy */
+  --text-secondary: #3f4346; /* brand gray */
+  --text-muted: #5f666d; /* brand gray-muted */
+  --text-dim: #676d74; /* 4.5:1 or more on bg/surface — do not make it lighter. Not used on surface-raised */
+  /* Brand radius and shadow — 8px is the cap and shadows are navy-tint only. */
+  --radius-sm: 2px;
+  --radius-md: 4px;
+  --radius-lg: 8px;
+  --shadow-sm: 0 0 0 1px rgba(9, 34, 63, 0.06), 0 1px 2px rgba(9, 34, 63, 0.04);
+  --shadow-md: 0 0 0 1px rgba(9, 34, 63, 0.08), 0 3px 6px rgba(9, 34, 63, 0.06);
+  --shadow-lg: 0 0 0 1px rgba(9, 34, 63, 0.1), 0 8px 16px rgba(9, 34, 63, 0.08);
+  --gap-tight: 4px;
+  --gap-normal: 8px;
+  --gap-loose: 16px;
+}

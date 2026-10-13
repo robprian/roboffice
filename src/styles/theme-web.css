@@ -1,0 +1,13 @@
+/*
+ * Surface colors of web screens — uses the Dante Labs brand v2 tokens (cream family) as is (Dante's decision, 2026-09-20: partial alignment).
+ * The product's own color (office green) remains an exception in tokens.css. The 3D office (theme-game) is separate from this file.
+ */
+.theme-web,
+:root {
+  --bg: #f3eee2; /* cream */
+  --bg-deep: #e9e3d3; /* cream-soft */
+  --surface: #faf7ee; /* cream-strong */
+  --surface-raised: #e9e3d3; /* cream-soft */
+  --border: #d9d2c0;
+  --border-subtle: #e4ddcc;
+}
