@@ -1,0 +1,12 @@
+# GitGuardian configuration for RobOffice.
+# Test files and fixtures intentionally contain fake credential-like values
+# (e.g. password: "readme-capture-local-only", SECRET = "test-secret-value")
+# to exercise validation logic. They are not real secrets.
+version: 2
+secret:
+  ignored-paths:
+    - '**/*.test.ts'
+    - '**/*.test.tsx'
+    - '**/*.test.js'
+    - 'scripts/readme-capture/fixture.ts'
+    - 'e2e/**'
